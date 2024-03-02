@@ -15,19 +15,30 @@ server_ctx start() {
 #define tls_state_handshake_finished 1 << 10
 
 tcp_client_ctx process_tcp_client(tcp_client_ctx client) {
-
-    assert(client.flags != file_not_found);
-
     slice cargo = slice_make(
         cargo_capacity,
         client.cargo.length,
         client.cargo.items
     );
 
+    slice file_data = slice_make(
+        cargo_capacity,
+        client.file_data.length,
+        client.file_data.items
+    );
+
     switch (client.flags) {
         case tcp_accept: {
             cargo = slice_cut(cargo, 0, cargo_capacity);
             client.flags = tcp_read | tls_state_handshake;
+            break;
+        }
+        case tcp_disconnect: {
+            client.flags = 0;
+            break;
+        }
+        case tcp_write | tcp_disconnect: {
+            client.flags = tcp_disconnect;
             break;
         }
         case tcp_read | tls_state_handshake: {
@@ -47,33 +58,17 @@ tcp_client_ctx process_tcp_client(tcp_client_ctx client) {
             break;
         }
         case tcp_read | tls_state_handshake_finished: {
-            u8 error = tls_decode_handshake_finished(cargo, client.ctx.tls);
-            if (error) {
-                assert(false);
-                client.flags = tcp_disconnect;
-            }
-            else {
-                cargo = slice_cut(cargo, 0, cargo_capacity);
-                client.flags = tcp_read;
-            }
-            break;
-            //
             tls_record_ctx record = tls_decode_record(cargo);
             if (record.error) {
                 client.flags = tcp_disconnect;
                 break;
             }
 
-            u8 content_type_change_cipher_spec = 20;
-            if (record.type == content_type_change_cipher_spec)) {
-                if (record.fragment.length != 1) {
-                    client.flags = tcp_disconnect; // unexpected_message
-                    break;
-                }
-
+            slice type_change_cipher_spec = slice_literal(20);
+            if (slices_equal(record.type, type_change_cipher_spec)) {
                 if (!record.after.length) {
                     cargo = slice_cut(cargo, 0, cargo_capacity);
-                    client.flags = tcp_read | tls_state_handshake_finished;
+                    client.flags = tcp_read | tls_state_handshake_finished; // todo: ehh
                     break;
                 }
 
@@ -84,7 +79,7 @@ tcp_client_ctx process_tcp_client(tcp_client_ctx client) {
                 }
             }
 
-            client.cts.tls.decryption_count = 0;
+            client.ctx.tls.decryption_count = 0;
             record = tls_decrypt_record(record, &client.ctx.tls);
             if (record.error) {
                 client.flags = tcp_disconnect;
@@ -97,28 +92,15 @@ tcp_client_ctx process_tcp_client(tcp_client_ctx client) {
                 break;
             }
 
-            u8 finished_key[sha256_hash_length];
-            hkdf_expand_sha256(
-                finished_key,
-                sha256_hash_length,
-                array_to_slice(tls.decryption_secret),
-                tls_finished_info
-            );
-
-            u8 verify_data[sha256_hash_length];
-            hmac_sha256(
-                verify_data,
-                array_to_slice(finished_key),
-                array_to_slice(tls.transcript_hash)
-            );
-
-            if (!slices_equal(handshake.message, array_to_slice(verify_data))) {
-                client.flags = tcp_disconnect; // decrypt_error
+            u8 error = tls_verify_handshake_finished(handshake, client.ctx.tls);
+            if (error) {
+                client.flags = tcp_disconnect;
                 break;
             }
 
             client.ctx.tls = tls_cipher_keys(client.ctx.tls);
-            tls.decryption_count = 0;
+            client.ctx.tls.decryption_count = 0;
+            client.ctx.tls.encryption_count = 0;
 
             if (!record.after.length) {
                 cargo = slice_cut(cargo, 0, cargo_capacity);
@@ -126,60 +108,129 @@ tcp_client_ctx process_tcp_client(tcp_client_ctx client) {
                 break;
             }
 
-            record = tls_decode_encrypted_record(record.after);
+            record = tls_decode_encrypted_record(record.after, &client.ctx.tls);
             if (record.error) {
                 client.flags = tcp_disconnect;
                 break;
             }
 
-            slice space = string_to_slice(" ");
-            slice http_get = string_to_slice("GET");
+            slice separator = string_to_slice(" /");
+            slice method = slice_around(&record.fragment, separator);
 
-            slice method = slice_around(&record.fragment, space);
-            if (!slices_equal(method, http_get)) {
+            slice http_method_get = string_to_slice("GET");
+            if (!slices_equal(method, http_method_get)) {
                 assert(false);
             }
 
-            // ...
+            separator = string_to_slice(" ");
+            slice url = slice_around(&record.fragment, separator);
+            if (!url.length) {
+                url = string_to_slice("main.html");
+            }
+
+            file_data = url;
+            client.flags = file_open;
             break;
         }
         case tcp_read: {
             if (!cargo.length) {
-                assert(false);
-                // disconnect;
+                client.flags = tcp_disconnect;
+                break;
             }
 
-            record = tls_decode_encrypted_record(cargo);
+            tls_record_ctx record = tls_decode_encrypted_record(cargo, &client.ctx.tls);
             if (record.error) {
                 client.flags = tcp_disconnect;
                 break;
             }
             
-            slice space = string_to_slice(" ");
-            slice http_get = string_to_slice("GET");
+            slice separator = string_to_slice(" /");
+            slice method = slice_around(&record.fragment, separator);
 
-            slice method = slice_around(&record.fragment, space);
-            if (!slices_equal(method, http_get)) {
+            slice http_method_get = string_to_slice("GET");
+            if (!slices_equal(method, http_method_get)) {
                 assert(false);
             }
 
-            client.flags = file_open;
-            //slice url = slice_around(&record.fragment, space);
-            static char name[] = "main.html";
-            slice url = string_to_slice(name);
-            client.file_data.items = url.items;
-            client.file_data.length = (u32) url.length;
+            separator = string_to_slice(" ");
+            slice url = slice_around(&record.fragment, separator);
+            if (!url.length) {
+                url = string_to_slice("main.html");
+            }
 
+            file_data = url;
+            client.flags = file_open;
             break;
         }
         case file_found: {
+            cargo = slice_clear(cargo);
+            cargo = tls_encrypted_record_start(cargo);
+
+            slice http_header = string_to_slice(
+                "HTTP/1.1 200 OK \r\nContent-Length:"
+            );
+            cargo = append(cargo, http_header);
+            cargo = append_ascii_decimal(cargo, client.file_length);
+            cargo = append(cargo, string_to_slice("\r\n\r\n"));
+
+            size_t tls_record_footer_length = poly1305_auth_tag_length + 1;
+            file_data = slice_cut(
+                cargo, 
+                cargo.length, 
+                cargo_capacity -
+                tls_record_footer_length
+            );
+
+            client.file_offset = 0;
             client.flags = file_read;
-            trigger_breakpoint();
-            // ...
+            break;
+        }
+        case file_not_found: {
+            cargo = slice_clear(cargo);
+            cargo = tls_encrypted_record_start(cargo);
+            slice status_line = string_to_slice("HTTP/1.1 404 Not Found\r\n\r\n");
+            cargo = append(cargo, status_line);
+            cargo = tls_encrypted_record_end(cargo, 23, &client.ctx.tls);
+            client.flags = tcp_write | tcp_disconnect;
+            break;
+        }
+        case file_read: {
+            cargo = slice_up(cargo, file_data.length);
+            cargo = tls_encrypted_record_end(cargo, 23, &client.ctx.tls);
+
+            client.file_offset += file_data.length;
+            client.flags = tcp_write | file_read;
+            break;
+        }
+        case tcp_write | file_read: {
+            if (client.file_offset == client.file_length) {
+                cargo = slice_cut(cargo, 0, cargo_capacity);
+                client.flags = tcp_read | file_close;
+            }
+            else {
+                cargo = slice_clear(cargo);
+                cargo = tls_encrypted_record_start(cargo);
+
+                size_t tls_record_footer_length = poly1305_auth_tag_length + 1;
+                file_data = slice_cut(
+                    cargo, 
+                    cargo.length, 
+                    cargo_capacity -
+                    tls_record_footer_length
+                );
+
+                client.flags = file_read;
+            }
+            break;
+        }
+        default: {
+            assert(false);
         }
     }
 
     client.cargo.items = cargo.items;
     client.cargo.length = (u32) cargo.length;
+    client.file_data.items = file_data.items;
+    client.file_data.length = (u32) file_data.length;
     return client;
 }

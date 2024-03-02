@@ -23,19 +23,50 @@ slice append_random(slice out, size_t length) {
 #define chacha20_nonce_length 12
 #define poly1305_auth_tag_length 16
 
+typedef struct tls_ctx tls_ctx;
+struct tls_ctx {
+    u8 encryption_key[chacha20_key_length];
+    u8 encryption_nonce[chacha20_nonce_length];
+    u64 encryption_count;
+    u8 decryption_key[chacha20_key_length];
+    u8 decryption_nonce[chacha20_nonce_length];
+    u64 decryption_count;
+    u8 handshake_secret[sha256_hash_length];
+    u8 encryption_secret[sha256_hash_length];
+    u8 decryption_secret[sha256_hash_length];
+    u8 transcript_hash[sha256_hash_length];
+};
+
 slice tls_derived_secret_info = slice_alloc(49);
 u8 tls_derived_secret[sha256_hash_length];
 
 // todo: This only works single-threaded. These should be treated as read-only
-// when multi-threading. 
+// when multi-threading. Either each thread will need it's own copy of these
+// or the key schedule function must copy the slices before appending to them. 
+// Ideally these are generated at compile time, but it shouldn't be a big deal either way.
 slice tls_handshake_encryption_secret_info = slice_alloc(54);
 slice tls_handshake_decryption_secret_info = slice_alloc(54);
 slice tls_encryption_secret_info = slice_alloc(54);
 slice tls_decryption_secret_info = slice_alloc(54);
-
 slice tls_key_info = slice_alloc(13);
 slice tls_iv_info = slice_alloc(12);
 slice tls_finished_info = slice_alloc(18);
+
+void tls_xor_nonce(
+    u8 out[chacha20_nonce_length], 
+    u8 nonce[chacha20_nonce_length], 
+    u64 record_count
+) {
+    size_t padding_length = chacha20_nonce_length - 8;
+    for (size_t i = 0; i < padding_length; i += 1) {
+        out[i] = nonce[i];
+    }
+    u8 count[8];
+    u64_to_be(count, record_count);
+    for (size_t i = 0; i < 8; i += 1) {
+        out[i + padding_length] = nonce[i + padding_length] ^ count[i];
+    }
+}
 
 typedef struct tls_record_ctx tls_record_ctx;
 struct tls_record_ctx {
@@ -43,15 +74,16 @@ struct tls_record_ctx {
     slice header;
     slice type;
     slice fragment;
+    slice after;
 };
 
-tls_record_ctx tls_decode_record(slice* in) {
+tls_record_ctx tls_decode_record(slice in) {
     // https://datatracker.ietf.org/doc/html/rfc8446#autoid-59
 
     tls_record_ctx record;
 
     size_t header_length = 5;
-    record.header = next(in, header_length);
+    record.header = next(&in, header_length);
     if (record.header.length != header_length) {
         record.error = 1; // decode_error
         return record;
@@ -77,14 +109,125 @@ tls_record_ctx tls_decode_record(slice* in) {
     );
 
     size_t decoded_length = be_to_u16(fragment_length.items);
-    record.fragment = next(in, decoded_length);
+    record.fragment = next(&in, decoded_length);
     if (record.fragment.length != decoded_length) {
         record.error = 1; // decode_error
         return record;
     }
 
     record.error = 0;
+    record.after = in;
     return record;
+}
+
+tls_record_ctx tls_decrypt_record(tls_record_ctx record, tls_ctx* tls) {
+    if (record.fragment.length < poly1305_auth_tag_length) {
+        record.error = 1; // bad_record_mac
+        return record;
+    }
+
+    slice auth_tag = slice_cut(
+        record.fragment,
+        record.fragment.length - poly1305_auth_tag_length,
+        record.fragment.length
+    );
+
+    record.fragment = slice_cut(
+        record.fragment,
+        0,
+        record.fragment.length - poly1305_auth_tag_length
+    );
+
+    u8 nonce[chacha20_nonce_length];
+    tls_xor_nonce(
+        nonce, 
+        tls->decryption_nonce, 
+        tls->decryption_count
+    );
+
+    int error = chacha20_poly1305_decrypt(
+        record.fragment,
+        tls->decryption_key,
+        nonce,
+        record.header,
+        auth_tag.items 
+    );
+
+    if (error) {
+        record.error = 1; // bad_record_mac
+        return record;
+    }
+
+    tls->decryption_count += 1;
+
+    while (true) {
+        if (!record.fragment.length) {
+            record.error = 1; // decode_error
+            return record;
+        }
+        if (record.fragment.items[record.fragment.length - 1]) {
+            break;
+        }
+        record.fragment = slice_down(record.fragment, 1);
+    }
+
+    record.type = slice_cut(record.fragment, record.fragment.length - 1, record.fragment.length);
+    //record.type = record.fragment.items[record.fragment.length - 1]; 
+    record.fragment = slice_down(record.fragment, 1);
+
+    return record;
+}
+
+tls_record_ctx tls_decode_encrypted_record(slice cargo, tls_ctx* tls) {
+    tls_record_ctx record = tls_decode_record(cargo);
+    if (record.error) {
+        return record;
+    }
+
+    record = tls_decrypt_record(record, tls);
+
+    return record;
+}
+
+slice tls_encrypted_record_start(slice in) {
+    // https://datatracker.ietf.org/doc/html/rfc8446#autoid-60
+
+    slice out = slice_end(in);
+    out = append_item(out, 23);
+    u8 version[2] = { 0x03, 0x03 };
+    out = append_length(out, version, array_length(version));
+    out = slice_up(out, 2);
+
+    return out;
+}
+
+slice tls_encrypted_record_end(slice in, u8 type, tls_ctx* tls) {
+    // https://datatracker.ietf.org/doc/html/rfc8446#autoid-60
+
+    slice header = slice_cut(in, 0, 5);
+    slice body = slice_cut(in, header.length, in.length);
+    body = append_item(body, 23);
+
+    u16 length = (u16) body.length + poly1305_auth_tag_length;
+    u16_to_be(&in.items[3], length);
+
+    u8 nonce[chacha20_nonce_length];
+    tls_xor_nonce(
+        nonce, 
+        tls->encryption_nonce, 
+        tls->encryption_count
+    );
+    tls->encryption_count += 1;
+
+    body = chacha20_poly1305_encrypt(
+        body,
+        tls->encryption_key, 
+        nonce,
+        header
+    );
+
+    in = slice_up(header, body.length);
+    return in;
 }
 
 typedef struct tls_handshake_ctx tls_handshake_ctx;
@@ -92,22 +235,23 @@ struct tls_handshake_ctx {
     u8 error;
     slice type;
     slice message;
+    slice after;
 };
 
-tls_handshake_ctx tls_decode_handshake(slice* in) {
+tls_handshake_ctx tls_decode_handshake(slice in) {
     // https://datatracker.ietf.org/doc/html/rfc8446#autoid-18
 
     tls_handshake_ctx handshake;
 
     size_t type_length = 1;
-    handshake.type = next(in, type_length);
+    handshake.type = next(&in, type_length);
     if (handshake.type.length != type_length) {
         handshake.error = 1; // decode_error
         return handshake;
     }
 
     size_t message_length_length = 3;
-    slice message_length = next(in, message_length_length);
+    slice message_length = next(&in, message_length_length);
     if (message_length.length != message_length_length) {
         handshake.error = 1; // decode_error
         return handshake;
@@ -121,14 +265,38 @@ tls_handshake_ctx tls_decode_handshake(slice* in) {
     message_length = slice_bump(message_length, 1);
 
     size_t decoded_length = be_to_u16(message_length.items);
-    handshake.message = next(in, decoded_length);
+    handshake.message = next(&in, decoded_length);
     if (handshake.message.length != decoded_length) {
         handshake.error = 1; // decode_error
         return handshake;
     }
 
     handshake.error = 0;
+    handshake.after = in;
     return handshake;
+}
+
+u8 tls_verify_handshake_finished(tls_handshake_ctx handshake, tls_ctx tls) {
+    u8 finished_key[sha256_hash_length];
+    hkdf_expand_sha256(
+        finished_key,
+        sha256_hash_length,
+        array_to_slice(tls.decryption_secret),
+        tls_finished_info
+    );
+
+    u8 verify_data[sha256_hash_length];
+    hmac_sha256(
+        verify_data,
+        array_to_slice(finished_key),
+        array_to_slice(tls.transcript_hash)
+    );
+
+    if (!slices_equal(handshake.message, array_to_slice(verify_data))) {
+        return 1; // decrypt_error
+    }
+
+    return 0;
 }
 
 typedef struct tls_extension_ctx tls_extension_ctx;
@@ -266,14 +434,14 @@ u8 tls_decode_client_hello(
     sha256_ctx* transcript_hash_ctx,
     u8 public_key[curve25519_key_length]
 ) {
-    tls_record_ctx record = tls_decode_record(&cargo);
+    tls_record_ctx record = tls_decode_record(cargo);
     if (record.error) {
         return record.error;
     }
 
     *transcript_hash_ctx = sha256_run(*transcript_hash_ctx, record.fragment);
 
-    tls_handshake_ctx handshake = tls_decode_handshake(&record.fragment);
+    tls_handshake_ctx handshake = tls_decode_handshake(record.fragment);
     if (handshake.error) {
         return handshake.error;
     }
@@ -364,6 +532,21 @@ u8 tls_decode_client_hello(
 
     return 0;
 }
+
+#if 0
+slice tls_append_server_hello(
+    slice cargo,
+    sha256_ctx* transcript_hash_ctx,
+    u8 private_key[curve25519_key_length]
+) {
+    slice record = tls_record_start(cargo, tls_record_type_handshake);
+    slice handshake = tls_handshake_start(record, tls_message_type_server_hello);
+    handshake = slice_up(handshake, 2);
+    handshake = append_random(handshake, 32);
+    handshake = slice_up(handshake, 33);
+    handshake = append(handshake, cipher_suite);
+}
+#endif
 
 slice tls_append_server_hello(
     slice cargo, 
@@ -545,20 +728,6 @@ slice tls_append_server_hello(
     return cargo;
 }
 
-typedef struct tls_ctx tls_ctx;
-struct tls_ctx {
-    u8 encryption_key[chacha20_key_length];
-    u8 encryption_nonce[chacha20_nonce_length];
-    u64 encryption_count;
-    u8 decryption_key[chacha20_key_length];
-    u8 decryption_nonce[chacha20_nonce_length];
-    u64 decryption_count;
-    u8 handshake_secret[sha256_hash_length];
-    u8 encryption_secret[sha256_hash_length];
-    u8 decryption_secret[sha256_hash_length];
-    u8 transcript_hash[sha256_hash_length];
-};
-
 tls_ctx tls_handshake_cipher_keys(
     tls_ctx tls, 
     sha256_ctx transcript_hash_ctx, 
@@ -729,6 +898,118 @@ slice tls_append_change_cipher_spec(slice cargo) {
     return cargo;
 }
 
+#if 0
+slice tls_append_encrypted_extensions(
+    slice cargo,
+    tls_ctx* tls,
+    sha256_ctx* transcript_hash_ctx
+) {
+    slice record_header = tls_encrypted_record_start(cargo);    
+    slice record_body = slice_end(header);
+
+    slice handshake_header = tls_handshake_start(record_body, type);
+    slice handshake_body = slice_end(handshake_header);
+
+    slice message = slice_literal(0, 0);
+    handshake_body = append(handshake_body, message);
+    tls_handshake_end(handshake_header, handshake_body);
+
+    record_body = slice_up(record_body, handshake_header.length);
+    record_body = slice_up(record_body, handshake_body.length);
+
+    cargo = tls_encrypted_record_end(
+        record_header, 
+        record_body, 
+        tls_record_type_handshake,
+        tls
+    );
+
+    return cargo;
+
+    //
+
+    slice header = tls_encrypted_record_start(cargo);    
+    slice body = slice_end(header);
+
+    body = tls_handshake_start(body, type);
+
+    slice message = slice_literal(0, 0);
+    body = append(body, message);
+    tls_handshake_end(body, body);
+
+    cargo = tls_encrypted_record_end(
+        header, 
+        body, 
+        tls_record_type_handshake,
+        tls
+    );
+
+    return cargo;
+
+    //
+
+    slice record = tls_encrypted_record_start(cargo);    
+    // record = append(record, data);
+    // record = tls_encrypted_record_end(record, tls_record_type_handshake, tls);
+
+    slice handshake = tls_handshake_start(record, type);
+
+    slice message = slice_literal(0, 0);
+    handshake = append(handshake, message);
+
+    handshake = tls_handshake_end(handshake);
+
+    record = slice_up(record, handshake.length);
+
+    cargo = tls_encrypted_record_end(
+        record,
+        tls_record_type_handshake,
+        tls
+    );
+
+    return cargo;
+
+    //
+
+    slice record = tls_encrypted_record_start(cargo);    
+
+    slice handshake = tls_handshake_start(record, type);
+    slice message = slice_literal(0, 0);
+    handshake = append(handshake, message);
+    handshake = tls_handshake_end(handshake);
+
+    record = slice_up(record, handshake.length);
+    cargo = tls_encrypted_record_end(
+        record,
+        tls_record_type_handshake,
+        tls
+    );
+
+    //
+
+    slice record = slice_end(cargo);
+    slice record = tls_encrypted_record_start(record);    
+
+    slice handshake = slice_end(record);
+    slice handshake = tls_handshake_start(handshake, type);
+
+    slice message = slice_literal(0, 0);
+    handshake = append(handshake, message);
+
+    handshake = tls_handshake_end(handshake);
+
+    record = slice_up(record, handshake.length);
+
+    cargo = tls_encrypted_record_end(
+        record,
+        tls_record_type_handshake,
+        tls
+    );
+
+    return cargo;
+}
+#endif
+
 slice tls_append_encrypted_extensions(
     slice cargo, 
     tls_ctx client, 
@@ -787,18 +1068,6 @@ slice tls_append_encrypted_extensions(
     );
 
     return cargo;
-}
-
-void xor_nonce(u8 out[chacha20_nonce_length], u8 nonce[chacha20_nonce_length], u64 record_count) {
-    size_t padding_length = chacha20_nonce_length - 8;
-    for (size_t i = 0; i < padding_length; i += 1) {
-        out[i] = nonce[i];
-    }
-    u8 count[8];
-    u64_to_be(count, record_count);
-    for (size_t i = 0; i < 8; i += 1) {
-        out[i + padding_length] = nonce[i + padding_length] ^ count[i];
-    }
 }
 
 slice tls_certificate = slice_literal(
@@ -950,7 +1219,7 @@ slice tls_append_certificate(
 
     client.encryption_count = 1;
     u8 nonce[chacha20_nonce_length];
-    xor_nonce(
+    tls_xor_nonce(
         nonce, 
         client.encryption_nonce, 
         client.encryption_count
@@ -1064,7 +1333,7 @@ slice tls_append_certificate_verify(
 
     client.encryption_count = 2;
     u8 nonce[chacha20_nonce_length];
-    xor_nonce(
+    tls_xor_nonce(
         nonce, 
         client.encryption_nonce, 
         client.encryption_count
@@ -1157,7 +1426,7 @@ slice tls_append_handshake_finished(
 
     client->encryption_count = 3;
     u8 nonce[chacha20_nonce_length];
-    xor_nonce(
+    tls_xor_nonce(
         nonce, 
         client->encryption_nonce, 
         client->encryption_count
@@ -1237,140 +1506,6 @@ u8 tls_process_handshake(tls_ctx* ctx, slice* cargo) {
     return 0;
 }
 
-u8 tls_decode_handshake_finished(slice cargo, tls_ctx* tls) {
-    tls_record_ctx record = tls_decode_record(&cargo);
-    if (record.error) {
-        return record.error;
-    }
-
-    slice content_type_change_cipher_spec = slice_literal(20);
-    slice change_cipher_spec = slice_literal(1);
-    if (slices_equal(record.type, content_type_change_cipher_spec)) {
-        if (!slices_equal(record.fragment, change_cipher_spec)) {
-            return 1; // unexpected_message
-        }
-
-        record = tls_decode_record(&cargo);
-        if (record.error) {
-            return record.error;
-        }
-    }
-
-    if (record.fragment.length < 16) {
-        return 1; // bad_record_mac
-    }
-
-    slice auth_tag = slice_cut(
-        record.fragment,
-        record.fragment.length - 16,
-        record.fragment.length
-    );
-
-    record.fragment = slice_cut(
-        record.fragment,
-        0,
-        record.fragment.length - 16
-    );
-
-    int error = chacha20_poly1305_decrypt(
-        record.fragment,
-        tls.decryption_key,
-        tls.decryption_nonce,
-        record.header,
-        auth_tag.items 
-    );
-
-    if (error) {
-        return 1; // bad_record_mac
-    }
-
-    tls_handshake_ctx handshake = tls_decode_handshake(&record.fragment);
-    if (handshake.error) {
-        return handshake.error;
-    }
-
-    u8 finished_key[sha256_hash_length];
-    hkdf_expand_sha256(
-        finished_key,
-        sha256_hash_length,
-        array_to_slice(tls.decryption_secret),
-        tls_finished_info
-    );
-
-    u8 verify_data[sha256_hash_length];
-    hmac_sha256(
-        verify_data,
-        array_to_slice(finished_key),
-        array_to_slice(tls.transcript_hash)
-    );
-
-    if (!slices_equal(handshake.message, array_to_slice(verify_data))) {
-        return 1; // decrypt_error
-    }
-
-    if (!cargo.length) {
-        return 0;
-    }
-
-    tls = tls_cipher_keys(tls);
-
-    tls.decryption_count = 0;
-    record = tls_decode_encrypted_record(cargo);
-    if (record.error) {
-        return record.error;
-    }
-
-    return 0;
-}
-
-tls_record_ctx tls_decode_encrypted_record(slice cargo, tls_ctx* tls) {
-    tls_record_ctx record = tls_decode_record(&cargo);
-    if (record.error) {
-        return record;
-    }
-
-    if (record.fragment.length < poly1305_auth_tag_length) {
-        record.error = 1; // bad_record_mac
-        return record;
-    }
-
-    slice auth_tag = slice_cut(
-        record.fragment,
-        record.fragment.length - poly1305_auth_tag_length,
-        record.fragment.length
-    );
-
-    record.fragment = slice_cut(
-        record.fragment,
-        0,
-        record.fragment.length - poly1305_auth_tag_length
-    );
-
-    u8 nonce[chacha20_nonce_length];
-    xor_nonce(
-        nonce, 
-        tls.decryption_nonce, 
-        tls.decryption_count
-    );
-
-    tls.decryption_count += 1;
-
-    int error = chacha20_poly1305_decrypt(
-        record.fragment,
-        tls.decryption_key,
-        nonce,
-        record.header,
-        auth_tag.items 
-    );
-
-    if (error) {
-        record.error = 1;
-        return record;
-    }
-
-    // todo: deal with padding and actual record type
-    return record;
-}
 
 slice tls_make_derived_secret_info(slice info) {
     slice empty = slice_make(0, 0, 0);
