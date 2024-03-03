@@ -189,7 +189,7 @@ tls_record_ctx tls_decode_encrypted_record(slice cargo, tls_ctx* tls) {
     return record;
 }
 
-slice tls_encrypted_record_start(slice in) {
+slice tls_encrypted_record_begin(slice in) {
     // https://datatracker.ietf.org/doc/html/rfc8446#autoid-60
 
     slice out = slice_end(in);
@@ -206,7 +206,7 @@ slice tls_encrypted_record_end(slice in, u8 type, tls_ctx* tls) {
 
     slice header = slice_cut(in, 0, 5);
     slice body = slice_cut(in, header.length, in.length);
-    body = append_item(body, 23);
+    body = append_item(body, type);
 
     u16 length = (u16) body.length + poly1305_auth_tag_length;
     u16_to_be(&in.items[3], length);
@@ -274,6 +274,26 @@ tls_handshake_ctx tls_decode_handshake(slice in) {
     handshake.error = 0;
     handshake.after = in;
     return handshake;
+}
+
+slice tls_handshake_begin(slice in, u8 type) {
+    // https://datatracker.ietf.org/doc/html/rfc8446#autoid-94
+
+    slice out = slice_end(in);
+    out = append_item(out, type);
+    out = slice_up(out, 3);
+
+    return out;
+}
+
+slice tls_handshake_end(slice in) {
+    // https://datatracker.ietf.org/doc/html/rfc8446#autoid-94
+
+    slice body = slice_cut(in, 4, in.length);
+    in.items[1] = 0;
+    u16_to_be(&in.items[2], (u16) body.length);
+
+    return in;
 }
 
 u8 tls_verify_handshake_finished(tls_handshake_ctx handshake, tls_ctx tls) {
@@ -898,177 +918,29 @@ slice tls_append_change_cipher_spec(slice cargo) {
     return cargo;
 }
 
-#if 0
 slice tls_append_encrypted_extensions(
     slice cargo,
     tls_ctx* tls,
     sha256_ctx* transcript_hash_ctx
 ) {
-    slice record_header = tls_encrypted_record_start(cargo);    
-    slice record_body = slice_end(header);
-
-    slice handshake_header = tls_handshake_start(record_body, type);
-    slice handshake_body = slice_end(handshake_header);
-
-    slice message = slice_literal(0, 0);
-    handshake_body = append(handshake_body, message);
-    tls_handshake_end(handshake_header, handshake_body);
-
-    record_body = slice_up(record_body, handshake_header.length);
-    record_body = slice_up(record_body, handshake_body.length);
-
-    cargo = tls_encrypted_record_end(
-        record_header, 
-        record_body, 
-        tls_record_type_handshake,
-        tls
-    );
-
-    return cargo;
-
-    //
-
-    slice header = tls_encrypted_record_start(cargo);    
-    slice body = slice_end(header);
-
-    body = tls_handshake_start(body, type);
-
-    slice message = slice_literal(0, 0);
-    body = append(body, message);
-    tls_handshake_end(body, body);
-
-    cargo = tls_encrypted_record_end(
-        header, 
-        body, 
-        tls_record_type_handshake,
-        tls
-    );
-
-    return cargo;
-
-    //
-
-    slice record = tls_encrypted_record_start(cargo);    
-    // record = append(record, data);
-    // record = tls_encrypted_record_end(record, tls_record_type_handshake, tls);
-
-    slice handshake = tls_handshake_start(record, type);
-
-    slice message = slice_literal(0, 0);
-    handshake = append(handshake, message);
-
-    handshake = tls_handshake_end(handshake);
-
-    record = slice_up(record, handshake.length);
-
-    cargo = tls_encrypted_record_end(
-        record,
-        tls_record_type_handshake,
-        tls
-    );
-
-    return cargo;
-
-    //
-
-    slice record = tls_encrypted_record_start(cargo);    
-
-    slice handshake = tls_handshake_start(record, type);
-    slice message = slice_literal(0, 0);
-    handshake = append(handshake, message);
-    handshake = tls_handshake_end(handshake);
-
-    record = slice_up(record, handshake.length);
-    cargo = tls_encrypted_record_end(
-        record,
-        tls_record_type_handshake,
-        tls
-    );
-
-    //
-
-    slice record = slice_end(cargo);
-    slice record = tls_encrypted_record_start(record);    
-
-    slice handshake = slice_end(record);
-    slice handshake = tls_handshake_start(handshake, type);
-
-    slice message = slice_literal(0, 0);
-    handshake = append(handshake, message);
-
-    handshake = tls_handshake_end(handshake);
-
-    record = slice_up(record, handshake.length);
-
-    cargo = tls_encrypted_record_end(
-        record,
-        tls_record_type_handshake,
-        tls
-    );
-
-    return cargo;
-}
-#endif
-
-slice tls_append_encrypted_extensions(
-    slice cargo, 
-    tls_ctx client, 
-    sha256_ctx* transcript_hash_ctx
-) {
     // https://datatracker.ietf.org/doc/html/rfc8446#autoid-42
 
-    slice header = slice_end(cargo);
+    slice record = tls_encrypted_record_begin(cargo);
 
-    u8 content_type_app_data = 23;
-    header = append_item(header, content_type_app_data);
+    slice handshake = tls_handshake_begin(record, 8);
+    slice value = slice_literal(0, 0);
+    handshake = append(handshake, value);
+    handshake = tls_handshake_end(handshake);
+    *transcript_hash_ctx = sha256_run(*transcript_hash_ctx, handshake);
 
-    slice legacy_record_version = slice_literal(0x03, 0x03);
-    header = append(header, legacy_record_version);
+    record = slice_up(record, handshake.length);
+    tls->encryption_count = 0;
+    record = tls_encrypted_record_end(record, 22, tls);
 
-    size_t fragment_length_length = 2;
-    slice fragment_length = slice_end(header);
-
-    header = slice_up(header, fragment_length_length);
-
-    slice fragment = slice_end(header);
-
-    u8 handshake_type_encrypted_extensions = 8;
-    fragment = append_item(
-        fragment, 
-        handshake_type_encrypted_extensions
-    );
-
-    slice message_length = slice_literal(0, 0, 2);
-    fragment = append(fragment, message_length);
-
-    slice message = slice_literal(0, 0);
-    fragment = append(fragment, message);
-
-    *transcript_hash_ctx = sha256_run(*transcript_hash_ctx, fragment);
-
-    u8 content_type_handshake = 22;
-    fragment = append_item(fragment, content_type_handshake);
-
-    fragment_length = copy_u16_be(
-        fragment_length, 
-        (u16) (fragment.length + poly1305_auth_tag_length)
-    );
-
-    fragment = chacha20_poly1305_encrypt(
-        fragment,
-        client.encryption_key, 
-        client.encryption_nonce,
-        header
-    );
-
-    cargo = slice_up(
-        cargo,
-        header.length +
-        fragment.length
-    );
+    cargo = slice_up(cargo, record.length);
 
     return cargo;
-}
+} 
 
 slice tls_certificate = slice_literal(
     0x30, 0x82, 0x03, 0xB8, 0x30, 0x82, 0x02, 0x20, 0xA0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x11, 0x00,
@@ -1481,7 +1353,7 @@ u8 tls_process_handshake(tls_ctx* ctx, slice* cargo) {
 
     *cargo = tls_append_encrypted_extensions(
         *cargo,
-        *ctx,
+        ctx,
         &transcript_hash_ctx
     );
 

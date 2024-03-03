@@ -164,7 +164,7 @@ tcp_client_ctx process_tcp_client(tcp_client_ctx client) {
         }
         case file_found: {
             cargo = slice_clear(cargo);
-            cargo = tls_encrypted_record_start(cargo);
+            cargo = tls_encrypted_record_begin(cargo);
 
             slice http_header = string_to_slice(
                 "HTTP/1.1 200 OK \r\nContent-Length:"
@@ -187,7 +187,7 @@ tcp_client_ctx process_tcp_client(tcp_client_ctx client) {
         }
         case file_not_found: {
             cargo = slice_clear(cargo);
-            cargo = tls_encrypted_record_start(cargo);
+            cargo = tls_encrypted_record_begin(cargo);
             slice status_line = string_to_slice("HTTP/1.1 404 Not Found\r\n\r\n");
             cargo = append(cargo, status_line);
             cargo = tls_encrypted_record_end(cargo, 23, &client.ctx.tls);
@@ -209,7 +209,7 @@ tcp_client_ctx process_tcp_client(tcp_client_ctx client) {
             }
             else {
                 cargo = slice_clear(cargo);
-                cargo = tls_encrypted_record_start(cargo);
+                cargo = tls_encrypted_record_begin(cargo);
 
                 size_t tls_record_footer_length = poly1305_auth_tag_length + 1;
                 file_data = slice_cut(
