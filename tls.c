@@ -683,7 +683,6 @@ slice tls_append_server_hello(
     handshake = append_random(handshake, tls_hello_random_length);
     handshake = append_item(handshake, (u8) session_id.length);
     handshake = append(handshake, session_id);
-    //handshake = slice_up(handshake, 33); // todo should echo legacy session id
     u8 cipher_suite[2] = { 0x13, 0x03 };
     handshake = append_length(handshake, cipher_suite, array_length(cipher_suite));
     handshake = append_item(handshake, 0); // legacy compression method;

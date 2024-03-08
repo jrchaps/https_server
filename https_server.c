@@ -197,7 +197,6 @@ tcp_client_ctx process_tcp_client(tcp_client_ctx client) {
         case file_read: {
             cargo = slice_up(cargo, file_data.length);
             cargo = tls_encrypted_record_end(cargo, 23, &client.ctx.tls);
-
             client.file_offset += file_data.length;
             client.flags = tcp_write | file_read;
             break;
