@@ -1,6 +1,5 @@
 #include "certificate.h"
 
-//
 slice copy_u16_be(slice out, u16 in) {
     u16_to_be(out.items, in);
     out = slice_cut(out, 0, 2);
@@ -32,7 +31,6 @@ slice read(slice* in, slice out) {
 
     return out;
 } 
-//
 
 #define curve25519_key_length 32
 #define chacha20_key_length 32
